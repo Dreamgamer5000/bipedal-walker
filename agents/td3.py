@@ -4,6 +4,8 @@ from agents.actor import Actor
 from agents.critic import Critic
 import numpy as np
 import torch.nn.functional as F
+from agents.forward_model import ForwardModel
+
 
 
 class TD3Agent:
@@ -15,7 +17,8 @@ class TD3Agent:
       Trick 2 — Delayed actor:       update actor every policy_freq critic steps
       Trick 3 — Target smoothing:    add clipped noise to target actions during update
     """
-    def __init__(
+    def __init__(       
+        
         self, state_dim, action_dim, max_action, device="cpu",
         lr_actor=3e-4, lr_critic=3e-4,
         gamma=0.99,           # discount — 0.99 ≈ cares about ~100 steps ahead
@@ -39,6 +42,11 @@ class TD3Agent:
         self.actor   = Actor(state_dim, action_dim, max_action).to(device)
         self.critic1 = Critic(state_dim, action_dim).to(device)
         self.critic2 = Critic(state_dim, action_dim).to(device)
+
+        self.forward_model = ForwardModel(state_dim, action_dim).to(device)
+        self.forward_opt   = torch.optim.Adam(
+            self.forward_model.parameters(), lr=3e-4)
+        self.fork_lambda   = 0.3   # tune this — 0.1 to 0.5
  
         # Target networks — start as exact copies, updated via Polyak
         self.actor_target   = Actor(state_dim, action_dim, max_action).to(device)
@@ -96,19 +104,42 @@ class TD3Agent:
         self.critic2_opt.step()
  
         actor_loss_val = None
-        # Trick 2: delayed actor update
+
+
+        # delayed actor update with forward looping knowledge(FORK)
         if self.total_updates % self.policy_freq == 0:
-            actor_loss = -self.critic1(states, self.actor(states)).mean()
-            actor_loss_val = actor_loss.item()
-            self.actor_opt.zero_grad(); actor_loss.backward()
+
+            # --- Forward model update (supervised, every actor step) ---
+            predicted_next = self.forward_model(states, actions)
+            forward_loss   = F.mse_loss(predicted_next, next_states)
+            self.forward_opt.zero_grad()
+            forward_loss.backward()
+            self.forward_opt.step()
+
+            # --- FORK actor update ---
+            current_actions   = self.actor(states)
+            predicted_next_s  = self.forward_model(states, current_actions)
+            # stop gradient through forward model into actor —
+            # we only want the actor to optimise its own weights
+            predicted_next_s  = predicted_next_s.detach()
+
+            future_actions    = self.actor(predicted_next_s)
+            q_current         = self.critic1(states, current_actions)
+            q_future          = self.critic1(predicted_next_s, future_actions)
+
+            # FORK loss: current value + weighted future value
+            actor_loss = -(q_current + self.fork_lambda * q_future).mean()
+
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_opt.step()
- 
-            # Polyak averaging for all target nets
+
+            # Polyak updates — unchanged
             self._soft_update(self.actor,   self.actor_target)
             self._soft_update(self.critic1, self.critic1_target)
             self._soft_update(self.critic2, self.critic2_target)
- 
+
         return {
             "critic1_loss": critic1_loss.item(),
             "critic2_loss": critic2_loss.item(),
@@ -131,7 +162,10 @@ class TD3Agent:
             "actor_opt":    self.actor_opt.state_dict(),
             "critic1_opt":  self.critic1_opt.state_dict(),
             "critic2_opt":  self.critic2_opt.state_dict(),
-            "total_updates": self.total_updates,        
+            "total_updates": self.total_updates,   
+            "forward_model": self.forward_model.state_dict(),
+            "forward_opt":   self.forward_opt.state_dict(),
+     
         }, path)
  
     def load(self, path):
@@ -150,6 +184,9 @@ class TD3Agent:
             self.critic2_opt.load_state_dict(ckpt["critic2_opt"])
         if "total_updates" in ckpt:
             self.total_updates = ckpt["total_updates"]
+        if "forward_model" in ckpt:
+            self.forward_model.load_state_dict(ckpt["forward_model"])
+            self.forward_opt.load_state_dict(ckpt["forward_opt"])
 
         print(f"Loaded from {path}  (updates so far: {self.total_updates})")
     
